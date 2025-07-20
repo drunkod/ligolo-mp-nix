@@ -1,82 +1,169 @@
 {
-  description = "A Ligolo-ng flake for running the proxy and agent with a pre-configured tunnel";
+  description = "A Ligolo-MP flake for running the server and client with an integrated E2E test.";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
+    ligolo-mp-src = {
+      # It's best practice to pin to a specific commit hash for true reproducibility.
+      # You can get this by running `nix flake lock --update-input ligolo-mp-src`
+      url = "github:ttpreport/ligolo-mp/main";
+      flake = false;
+    };
   };
 
-  outputs = { self, nixpkgs, flake-utils }:
+  outputs = { self, nixpkgs, flake-utils, ligolo-mp-src }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
-        ligoloPackage = pkgs.ligolo-ng;
+
+        # --- Common Build Logic ---
+        # By creating a base derivation, we avoid repeating common attributes.
+        ligolo-mp-base = pkgs.buildGoModule {
+          pname = "ligolo-mp";
+          version = "2"; # This could be derived from a tag if one existed
+          src = ligolo-mp-src;
+          ldflags = [ "-s" "-w" ];
+          vendorHash = null;
+        };
+
+        # --- Package Definitions ---
+        # The unwrapped packages are now much cleaner.
+        ligolo-mp-server-unwrapped = ligolo-mp-base.overrideAttrs (old: {
+          pname = "${old.pname}-server";
+          nativeBuildInputs = [ pkgs.gnumake pkgs.zip pkgs.curl pkgs.garble pkgs.go ];
+          postPatch = ''
+            make assets
+          '';
+          sourceRoot = "source";
+          subPackages = [ "cmd/server" ];
+          postInstall = ''
+            mv $out/bin/server $out/bin/ligolo-mp-server
+          '';
+        });
+
+        ligolo-mp-client-unwrapped = ligolo-mp-base.overrideAttrs {
+          pname = "ligolo-mp-client";
+          subPackages = [ "cmd/client" ];
+          postInstall = ''
+            mv $out/bin/client $out/bin/ligolo-mp-client
+          '';
+        };
+
+        ligolo-mp-agent-for-test = ligolo-mp-base.overrideAttrs (old: {
+          pname = "${old.pname}-agent";
+          sourceRoot = "source/artifacts/agent";
+          subPackages = [ "." ];
+          postPatch = ''
+            substituteInPlace agent.go \
+              --replace '{{ .ProxyServer }}' "" \
+              --replace '{{ .Servers }}' "server:11601" \
+              --replace '{{ .AgentCert }}' "" \
+              --replace '{{ .AgentKey }}' "" \
+              --replace '{{ .CACert }}' "" \
+              --replace '{{ .IgnoreEnvProxy }}' "true"
+          '';
+          postInstall = ''
+            mv $out/bin/ligolo-mp-agent $out/bin/agent
+          '';
+        });
+
+        # --- NixOS Module Definition ---
+        # Define the module once in the `let` block for clarity.
+        ligolo-mp-module = { lib, config, ... }: {
+          options = {
+            services.ligolo-mp-server.enable = lib.mkEnableOption "Enable the Ligolo-MP server daemon.";
+            services.ligolo-mp-agent.enable = lib.mkEnableOption "Enable the Ligolo-MP test agent.";
+          };
+
+          config = lib.mkMerge [
+            (lib.mkIf (config.services.ligolo-mp-server.enable || config.services.ligolo-mp-agent.enable) {
+              nix.settings.extra-experimental-features = [ "nix-command" "flakes" ];
+            })
+            (lib.mkIf config.services.ligolo-mp-server.enable {
+              networking.firewall.allowedTCPPorts = [ 11601 58008 ];
+              systemd.services.ligolo-mp-server = {
+                description = "Ligolo-MP Server Daemon";
+                wantedBy = [ "multi-user.target" ];
+                after = [ "network.target" ];
+                serviceConfig = {
+                  ExecStart = "${ligolo-mp-server-unwrapped}/bin/ligolo-mp-server -daemon -agent-addr 0.0.0.0:11601 -operator-addr 0.0.0.0:58008";
+                  Restart = "on-failure";
+                  RestartSec = 3;
+                  User = "root";
+                };
+              };
+            })
+            (lib.mkIf config.services.ligolo-mp-agent.enable {
+                systemd.services.ligolo-mp-agent = {
+                  description = "Ligolo-MP Test Agent";
+                  wantedBy = [ "multi-user.target" ];
+                  after = [ "network.target" ];
+                  path = [ pkgs.sudo ];
+                  serviceConfig = {
+                    ExecStart = "${ligolo-mp-agent-for-test}/bin/agent -connect server:11601 -ignore-cert";
+                    Restart = "on-failure";
+                    RestartSec = 3;
+                    User = "root";
+                  };
+                };
+            })
+          ];
+        };
 
       in
       {
-        # Packages define runnable wrapper scripts.
+        # --- Exposed Packages and Apps ---
         packages = {
-          # Package to run the Ligolo-ng proxy (server-side).
-          ligolo-proxy = pkgs.writeShellScriptBin "run-ligolo-proxy" ''
-            #!${pkgs.stdenv.shell}
-            echo "### Starting Ligolo-ng Proxy with Config File ###"
-
-            if [ "$(id -u)" -ne 0 ]; then
-                echo "ERROR: This command must be run with root privileges (e.g., using 'sudo')."
-                exit 1
-            fi
-
-            echo "The process will run in the background."
-
-            # Use '-daemon' to run as a background process.
-            # Use '-selfcert' for easy testing without real certs.
-            # Use '-config' to load our pre-configured interface and routes.
-            exec ${ligoloPackage}/bin/proxy -daemon -selfcert -config ligolo-ng.yaml "$@"
-          '';
-
-          # Package to run the Ligolo-ng agent (client-side).
-          ligolo-agent = pkgs.writeShellScriptBin "run-ligolo-agent" ''
-            #!${pkgs.stdenv.shell}
-            echo "### Starting Ligolo-ng Agent ###"
-            if [ $# -eq 0 ]; then
-                echo "ERROR: Please provide connection arguments." >&2
-                echo "Usage: nix run .#agent -- -connect YOUR_VPS_IP:11601 -ignore-cert"
-                exit 1
-            fi
-            echo "Connecting to proxy with arguments: $@"
-            # The agent does not require root privileges, but you must run it with
-            # 'sudo' if you want it to create a TUN interface on the client.
-            exec ${ligoloPackage}/bin/agent "$@"
-          '';
-
-          # Expose the raw ligolo-ng package.
-          ligolo-ng = ligoloPackage;
+          server = ligolo-mp-server-unwrapped;
+          client = ligolo-mp-client-unwrapped;
+          default = self.packages.${system}.client;
         };
 
-        # Apps allow running packages directly with 'nix run'.
         apps = {
-          proxy = {
-            type = "app";
-            program = "${self.packages.${system}.ligolo-proxy}/bin/run-ligolo-proxy";
-          };
-          agent = {
-            type = "app";
-            program = "${self.packages.${system}.ligolo-agent}/bin/run-ligolo-agent";
-          };
+          server = { type = "app"; program = "${self.packages.${system}.server}/bin/ligolo-mp-server"; };
+          client = { type = "app"; program = "${self.packages.${system}.client}/bin/ligolo-mp-client"; };
+          default = self.apps.${system}.client;
         };
 
-        defaultApp = self.apps.${system}.proxy;
+        # --- NixOS Module ---
+        nixosModules.default = ligolo-mp-module;
 
+        # --- Development Environment ---
         devShells.default = pkgs.mkShell {
-          name = "ligolo-ng-dev-shell";
-          buildInputs = [ ligoloPackage pkgs.iproute2 ];
-          shellHook = ''
-            echo "### Ligolo-ng Development Shell ###"
-            echo "The 'proxy' and 'agent' executables are in your PATH."
+          name = "ligolo-mp-dev-shell";
+          packages = [
+            self.packages.${system}.server
+            self.packages.${system}.client
+            pkgs.iproute2
+          ];
+        };
+
+        # --- Automated Checks ---
+        checks.e2e-test = pkgs.nixosTest {
+          name = "ligolo-mp-e2e-test";
+          nodes = {
+            # References to the module are now cleaner.
+            server = { ... }: { imports = [ ligolo-mp-module ]; services.ligolo-mp-server.enable = true; };
+            client = { ... }: { imports = [ ligolo-mp-module ]; services.ligolo-mp-agent.enable = true; };
+          };
+
+          testScript = ''
+            start_all()
+
+            server.wait_for_unit("ligolo-mp-server.service")
+            server.wait_for_open_port(11601)
+            client.wait_for_unit("ligolo-mp-agent.service")
+
+            # Give the agent time to connect
+            server.sleep(5)
+
+            # Confirm the server logged a new session from the client.
+            with server.nested("Testing for new session"):
+                server.succeed("journalctl -u ligolo-mp-server --no-pager | grep 'new session with'")
           '';
         };
 
         formatter = pkgs.nixpkgs-fmt;
-      }
-    );
+      });
 }
