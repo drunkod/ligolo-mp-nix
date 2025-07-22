@@ -250,6 +250,49 @@
 
         # --- Tests ---
         checks = {
+          e2e-test = pkgs.nixosTest {
+            name = "ligolo-mp-e2e-test";
+            
+            nodes = {
+              server = { ... }: {
+                imports = [ self.nixosModules.${system}.default ];
+                services.ligolo-mp.server.enable = true;
+              };
+              
+              agent = { ... }: {
+                imports = [ self.nixosModules.${system}.default ];
+                services.ligolo-mp.agent = {
+                  enable = true;
+                  connectTo = "server:${toString defaultPorts.agent}";
+                  ignoreCert = true;
+                };
+              };
+            };
+
+            testScript = ''
+              start_all()
+
+              # Wait for services to start
+              server.wait_for_unit("ligolo-mp-server.service")
+              server.wait_for_open_port(${toString defaultPorts.agent})
+              server.wait_for_open_port(${toString defaultPorts.operator})
+              
+              agent.wait_for_unit("ligolo-mp-agent.service")
+
+              # Give the agent time to establish connection
+              agent.sleep(5)
+
+              # Verify agent connected
+              with subtest("Agent connection established"):
+                  server.succeed("journalctl -u ligolo-mp-server --no-pager | grep -E '(new session|connected)'")
+              
+              # Verify services are still running
+              with subtest("Services remain stable"):
+                  server.succeed("systemctl is-active ligolo-mp-server.service")
+                  agent.succeed("systemctl is-active ligolo-mp-agent.service")
+            '';
+          };
+
           # Additional build test
           build-all = pkgs.runCommand "build-test" {} ''
             echo "Testing builds..."
