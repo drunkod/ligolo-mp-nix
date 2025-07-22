@@ -22,7 +22,7 @@
         hashes = {
           linux = {
             amd64 = {
-              main = "5b8936131264e4fe298cdbef9818a5acbfbedc76b3f4b3316d6291584b2761a2";
+              main = "sha256-bnWvpGxwB+HLtVlwCpdwWBIg5rQ4GXHYFJcbR8mSfvk=";
               client = "b2bb3d4d8717c378b7387c3706f3aadb258d1b37fb490b21e111408610e8629d";
             };
             arm64 = {
@@ -146,10 +146,10 @@
           default = ligolo-mp-client;
         };
 
-        apps = {
-          server = { type = "app"; program = "${ligolo-mp-server}/bin/ligolo-mp-server"; };
-          client = { type = "app"; program = "${ligolo-mp-client}/bin/ligolo-mp-client"; };
-          agent  = { type = "app"; program = "${ligolo-mp-agent}/bin/agent"; };
+        apps = with pkgs.lib; {
+          server = { type = "app"; program = "${ligolo-mp-server}/bin/ligolo-mp-server"; meta = { description = "Ligolo-MP Server"; }; };
+          client = { type = "app"; program = "${ligolo-mp-client}/bin/ligolo-mp-client"; meta = { description = "Ligolo-MP Client"; }; };
+          agent  = { type = "app"; program = "${ligolo-mp-agent}/bin/agent"; meta = { description = "Ligolo-MP Agent"; }; };
           default = self.apps.${system}.client;
         };
 
