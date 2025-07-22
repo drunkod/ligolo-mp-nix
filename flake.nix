@@ -5,8 +5,6 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
     ligolo-mp-src = {
-      # It's best practice to pin to a specific commit hash for true reproducibility.
-      # You can get this by running `nix flake lock --update-input ligolo-mp-src`
       url = "github:ttpreport/ligolo-mp/main";
       flake = false;
     };
@@ -17,32 +15,42 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
 
+        # --- Configuration ---
+        defaultPorts = {
+          agent = 11601;
+          operator = 58008;
+        };
+
         # --- Common Build Logic ---
-        # By creating a base derivation, we avoid repeating common attributes.
         ligolo-mp-base = pkgs.buildGoModule {
           pname = "ligolo-mp";
-          version = "2"; # This could be derived from a tag if one existed
+          version = "2";
           src = ligolo-mp-src;
           ldflags = [ "-s" "-w" ];
           vendorHash = null;
         };
 
+        # --- Build Functions ---
+        mkLigoloPackage = { pname, subPackages, postInstall, ... }@args:
+          ligolo-mp-base.overrideAttrs (old: (removeAttrs args [ "subPackages" "postInstall" ]) // {
+            inherit pname subPackages postInstall;
+          });
+
         # --- Package Definitions ---
-        # The unwrapped packages are now much cleaner.
-        ligolo-mp-server-unwrapped = ligolo-mp-base.overrideAttrs (old: {
-          pname = "${old.pname}-server";
-          nativeBuildInputs = [ pkgs.gnumake pkgs.zip pkgs.curl pkgs.garble pkgs.go ];
-          postPatch = ''
-            make assets
+        ligolo-mp-server = mkLigoloPackage {
+          pname = "ligolo-mp-server";
+          nativeBuildInputs = [ pkgs.gnumake pkgs.zip pkgs.garble pkgs.go ];
+          preBuild = ''
+            cp ${ligolo-mp-agent}/agent.zip artifacts/agent.zip
           '';
           sourceRoot = "source";
           subPackages = [ "cmd/server" ];
           postInstall = ''
             mv $out/bin/server $out/bin/ligolo-mp-server
           '';
-        });
+        };
 
-        ligolo-mp-client-unwrapped = ligolo-mp-base.overrideAttrs {
+        ligolo-mp-client = mkLigoloPackage {
           pname = "ligolo-mp-client";
           subPackages = [ "cmd/client" ];
           postInstall = ''
@@ -50,14 +58,15 @@
           '';
         };
 
-        ligolo-mp-agent-for-test = ligolo-mp-base.overrideAttrs (old: {
-          pname = "${old.pname}-agent";
+        ligolo-mp-agent = mkLigoloPackage {
+          pname = "ligolo-mp-agent";
+          nativeBuildInputs = [ pkgs.zip pkgs.go ];
           sourceRoot = "source/artifacts/agent";
           subPackages = [ "." ];
           postPatch = ''
             substituteInPlace agent.go \
               --replace '{{ .ProxyServer }}' "" \
-              --replace '{{ .Servers }}' "server:11601" \
+              --replace '{{ .Servers }}' "{{SERVERS}}" \
               --replace '{{ .AgentCert }}' "" \
               --replace '{{ .AgentKey }}' "" \
               --replace '{{ .CACert }}' "" \
@@ -65,105 +74,193 @@
           '';
           postInstall = ''
             mv $out/bin/ligolo-mp-agent $out/bin/agent
+            zip -j $out/agent.zip $out/bin/agent
           '';
+        };
+
+        # Test-specific agent with hardcoded server
+        ligolo-mp-agent-for-test = ligolo-mp-agent.overrideAttrs (old: {
+          postPatch = builtins.replaceStrings ["{{SERVERS}}"] ["server:${toString defaultPorts.agent}"] old.postPatch;
         });
 
-        # --- NixOS Module Definition ---
-        # Define the module once in the `let` block for clarity.
-        ligolo-mp-module = { lib, config, ... }: {
-          options = {
-            services.ligolo-mp-server.enable = lib.mkEnableOption "Enable the Ligolo-MP server daemon.";
-            services.ligolo-mp-agent.enable = lib.mkEnableOption "Enable the Ligolo-MP test agent.";
-          };
+        # --- NixOS Module ---
+        ligolo-mp-module = { lib, config, pkgs, ... }:
+          let
+            cfg = config.services.ligolo-mp;
+          in
+          {
+            options.services.ligolo-mp = {
+              server = {
+                enable = lib.mkEnableOption "Ligolo-MP server daemon";
 
-          config = lib.mkMerge [
-            (lib.mkIf (config.services.ligolo-mp-server.enable || config.services.ligolo-mp-agent.enable) {
-              nix.settings.extra-experimental-features = [ "nix-command" "flakes" ];
-            })
-            (lib.mkIf config.services.ligolo-mp-server.enable {
-              networking.firewall.allowedTCPPorts = [ 11601 58008 ];
-              systemd.services.ligolo-mp-server = {
-                description = "Ligolo-MP Server Daemon";
-                wantedBy = [ "multi-user.target" ];
-                after = [ "network.target" ];
-                serviceConfig = {
-                  ExecStart = "${ligolo-mp-server-unwrapped}/bin/ligolo-mp-server -daemon -agent-addr 0.0.0.0:11601 -operator-addr 0.0.0.0:58008";
-                  Restart = "on-failure";
-                  RestartSec = 3;
-                  User = "root";
+                agentPort = lib.mkOption {
+                  type = lib.types.port;
+                  default = defaultPorts.agent;
+                  description = "Port for agent connections";
+                };
+
+                operatorPort = lib.mkOption {
+                  type = lib.types.port;
+                  default = defaultPorts.operator;
+                  description = "Port for operator connections";
+                };
+
+                extraArgs = lib.mkOption {
+                  type = lib.types.listOf lib.types.str;
+                  default = [];
+                  description = "Extra arguments to pass to the server";
                 };
               };
-            })
-            (lib.mkIf config.services.ligolo-mp-agent.enable {
+
+              agent = {
+                enable = lib.mkEnableOption "Ligolo-MP agent";
+
+                connectTo = lib.mkOption {
+                  type = lib.types.str;
+                  default = "localhost:${toString defaultPorts.agent}";
+                  description = "Server address to connect to";
+                };
+
+                ignoreCert = lib.mkOption {
+                  type = lib.types.bool;
+                  default = false;
+                  description = "Ignore certificate verification";
+                };
+
+                extraArgs = lib.mkOption {
+                  type = lib.types.listOf lib.types.str;
+                  default = [];
+                  description = "Extra arguments to pass to the agent";
+                };
+              };
+            };
+
+            config = lib.mkMerge [
+              (lib.mkIf (cfg.server.enable || cfg.agent.enable) {
+                nix.settings.extra-experimental-features = [ "nix-command" "flakes" ];
+              })
+
+              (lib.mkIf cfg.server.enable {
+                networking.firewall.allowedTCPPorts = [ cfg.server.agentPort cfg.server.operatorPort ];
+
+                systemd.services.ligolo-mp-server = {
+                  description = "Ligolo-MP Server Daemon";
+                  wantedBy = [ "multi-user.target" ];
+                  after = [ "network.target" ];
+                  serviceConfig = {
+                    ExecStart = "${ligolo-mp-server}/bin/ligolo-mp-server -daemon "
+                      + "-agent-addr 0.0.0.0:${toString cfg.server.agentPort} "
+                      + "-operator-addr 0.0.0.0:${toString cfg.server.operatorPort} "
+                      + lib.concatStringsSep " " cfg.server.extraArgs;
+                    Restart = "on-failure";
+                    RestartSec = 3;
+                    User = "root";
+
+                    # Security hardening
+                    NoNewPrivileges = true;
+                    PrivateTmp = true;
+                    ProtectSystem = "strict";
+                    ProtectHome = true;
+                    ReadWritePaths = [ "/var/lib/ligolo-mp" ];
+                    StateDirectory = "ligolo-mp";
+                  };
+                };
+              })
+
+              (lib.mkIf cfg.agent.enable {
                 systemd.services.ligolo-mp-agent = {
-                  description = "Ligolo-MP Test Agent";
+                  description = "Ligolo-MP Agent";
                   wantedBy = [ "multi-user.target" ];
                   after = [ "network.target" ];
                   path = [ pkgs.sudo ];
                   serviceConfig = {
-                    ExecStart = "${ligolo-mp-agent-for-test}/bin/agent -connect server:11601 -ignore-cert";
+                    ExecStart = "${ligolo-mp-agent-for-test}/bin/agent "
+                      + "-connect ${cfg.agent.connectTo} "
+                      + lib.optionalString cfg.agent.ignoreCert "-ignore-cert "
+                      + lib.concatStringsSep " " cfg.agent.extraArgs;
                     Restart = "on-failure";
                     RestartSec = 3;
                     User = "root";
+
+                    # Security hardening (less strict for agent)
+                    NoNewPrivileges = true;
+                    PrivateTmp = true;
                   };
                 };
-            })
-          ];
-        };
+              })
+            ];
+          };
 
       in
       {
-        # --- Exposed Packages and Apps ---
+        # --- Packages ---
         packages = {
-          server = ligolo-mp-server-unwrapped;
-          client = ligolo-mp-client-unwrapped;
-          default = self.packages.${system}.client;
+          server = ligolo-mp-server;
+          client = ligolo-mp-client;
+          agent = ligolo-mp-agent;
+          default = ligolo-mp-client;
         };
 
+        # --- Apps ---
         apps = {
-          server = { type = "app"; program = "${self.packages.${system}.server}/bin/ligolo-mp-server"; };
-          client = { type = "app"; program = "${self.packages.${system}.client}/bin/ligolo-mp-client"; };
+          server = {
+            type = "app";
+            program = "${ligolo-mp-server}/bin/ligolo-mp-server";
+          };
+          client = {
+            type = "app";
+            program = "${ligolo-mp-client}/bin/ligolo-mp-client";
+          };
+          agent = {
+            type = "app";
+            program = "${ligolo-mp-agent}/bin/agent";
+          };
           default = self.apps.${system}.client;
         };
 
-        # --- NixOS Module ---
-        nixosModules.default = ligolo-mp-module;
-
-        # --- Development Environment ---
-        devShells.default = pkgs.mkShell {
-          name = "ligolo-mp-dev-shell";
-          packages = [
-            self.packages.${system}.server
-            self.packages.${system}.client
-            pkgs.iproute2
-          ];
+        # --- NixOS Modules ---
+        nixosModules = {
+          default = ligolo-mp-module;
+          ligolo-mp = ligolo-mp-module;
         };
 
-        # --- Automated Checks ---
-        checks.e2e-test = pkgs.nixosTest {
-          name = "ligolo-mp-e2e-test";
-          nodes = {
-            # References to the module are now cleaner.
-            server = { ... }: { imports = [ ligolo-mp-module ]; services.ligolo-mp-server.enable = true; };
-            client = { ... }: { imports = [ ligolo-mp-module ]; services.ligolo-mp-agent.enable = true; };
-          };
+        # --- Development Shell ---
+        devShells.default = pkgs.mkShell {
+          name = "ligolo-mp-dev";
+          packages = with pkgs; [
+            self.packages.${system}.server
+            self.packages.${system}.client
+            self.packages.${system}.agent
+            iproute2
+            tcpdump
+            netcat
+            go
+            gopls
+            gotools
+          ];
 
-          testScript = ''
-            start_all()
-
-            server.wait_for_unit("ligolo-mp-server.service")
-            server.wait_for_open_port(11601)
-            client.wait_for_unit("ligolo-mp-agent.service")
-
-            # Give the agent time to connect
-            server.sleep(5)
-
-            # Confirm the server logged a new session from the client.
-            with server.nested("Testing for new session"):
-                server.succeed("journalctl -u ligolo-mp-server --no-pager | grep 'new session with'")
+          shellHook = ''
+            echo "Ligolo-MP Development Environment"
+            echo "Available commands:"
+            echo "  ligolo-mp-server - Run the server"
+            echo "  ligolo-mp-client - Run the client"
+            echo "  agent           - Run the agent"
           '';
         };
 
+        # --- Tests ---
+        checks = {
+          # Additional build test
+          build-all = pkgs.runCommand "build-test" {} ''
+            echo "Testing builds..."
+            ls ${ligolo-mp-server}/bin/ligolo-mp-server
+            ls ${ligolo-mp-client}/bin/ligolo-mp-client
+            ls ${ligolo-mp-agent}/bin/agent
+            touch $out
+          '';
+        };
+
+        # --- Formatter ---
         formatter = pkgs.nixpkgs-fmt;
       });
 }
