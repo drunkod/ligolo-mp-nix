@@ -18,23 +18,6 @@
         "type": "github"
       }
     },
-    "ligolo-mp-src": {
-      "flake": false,
-      "locked": {
-        "lastModified": 1752426608,
-        "narHash": "sha256-0Dl3U/Gc9dYKiBWZgmxfq+oSPz4D3NyczlDY2XLIgIM=",
-        "owner": "ttpreport",
-        "repo": "ligolo-mp",
-        "rev": "84d7607da1eddec707678d93dad363dd90422f37",
-        "type": "github"
-      },
-      "original": {
-        "owner": "ttpreport",
-        "ref": "main",
-        "repo": "ligolo-mp",
-        "type": "github"
-      }
-    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1752950548,
@@ -54,7 +37,6 @@
     "root": {
       "inputs": {
         "flake-utils": "flake-utils",
-        "ligolo-mp-src": "ligolo-mp-src",
         "nixpkgs": "nixpkgs"
       }
     },
